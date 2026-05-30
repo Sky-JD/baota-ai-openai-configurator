@@ -40,7 +40,60 @@
 
 普通聊天不强制需要 Embedding。
 
-## 快速使用
+## 从 GitHub 下载运行
+
+在宝塔面板所在 Linux 服务器上执行以下任一命令。
+
+使用 `curl`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sky-JD/baota-ai-openai-configurator/main/configure_bt_ai_openai_api.sh \
+  -o configure_bt_ai_openai_api.sh
+bash configure_bt_ai_openai_api.sh
+```
+
+使用 `wget`：
+
+```bash
+wget -O configure_bt_ai_openai_api.sh \
+  https://raw.githubusercontent.com/Sky-JD/baota-ai-openai-configurator/main/configure_bt_ai_openai_api.sh
+bash configure_bt_ai_openai_api.sh
+```
+
+也可以一行直接运行：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Sky-JD/baota-ai-openai-configurator/main/configure_bt_ai_openai_api.sh)
+```
+
+如果系统不支持 Bash 进程替换，使用：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sky-JD/baota-ai-openai-configurator/main/configure_bt_ai_openai_api.sh | bash
+```
+
+安全建议：生产环境建议先下载脚本并查看内容，再执行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sky-JD/baota-ai-openai-configurator/main/configure_bt_ai_openai_api.sh \
+  -o configure_bt_ai_openai_api.sh
+less configure_bt_ai_openai_api.sh
+bash configure_bt_ai_openai_api.sh
+```
+
+非交互式一键配置示例：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Sky-JD/baota-ai-openai-configurator/main/configure_bt_ai_openai_api.sh \
+  -o configure_bt_ai_openai_api.sh
+bash configure_bt_ai_openai_api.sh \
+  --base-url https://api.example.com/v1 \
+  --api-key sk-xxxx \
+  --models mimo-v2.5-pro \
+  --yes
+```
+
+## 本地脚本运行
 
 把脚本上传到服务器后执行：
 
@@ -269,4 +322,3 @@ bash configure_bt_ai_openai_api.sh \
 configure_bt_ai_openai_api.sh  主脚本
 README.md                     使用说明
 ```
-
