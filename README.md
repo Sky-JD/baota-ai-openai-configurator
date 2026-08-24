@@ -147,6 +147,8 @@ bash configure_bt_ai_openai_api.sh \
 支持时出现 `unknown url type: https`。如果 `curl` 不存在或发生传输层/兼容性
 错误，脚本会回退到 Python `urllib`。为避免 API Key 被转发到其他地址，两种
 请求方式都不会自动跟随重定向，也不会在代理失败后静默改为直连。
+粘贴 API Key 时附带的首尾空格、制表符或回车会自动清理；Key 中间的控制字符
+仍会被拒绝。
 
 在交互模式下，多个模型会让你选择；在 `--yes` 模式下会默认选择第一个模型。如果自动获取失败，脚本会解析 OpenAI/New API 风格错误，例如：
 
@@ -311,6 +313,7 @@ bt restart
 - 当前 Key 没有模型列表权限
 - Base URL 填错
 - 系统没有安装 `curl`，且当前 Python 不支持 HTTPS
+- API Key 粘贴时混入了非首尾位置的换行或其他控制字符
 
 可以手动传入模型：
 

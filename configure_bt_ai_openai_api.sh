@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 SUPPORTED_DISTROS="CentOS/RHEL/AlmaLinux/Rocky Linux/Ubuntu/Debian"
 
 PANEL_PATH="${BT_PANEL:-/www/server/panel}"
@@ -178,6 +178,13 @@ normalize_base_url() {
   printf '%s\n' "$url"
 }
 
+trim_surrounding_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
 validate_base_url() {
   local py="$1"
   local url="$2"
@@ -236,6 +243,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -273,7 +281,7 @@ def parse_error_body(raw):
     return text[:500]
 
 base_url = os.environ["BASE_URL"].rstrip("/")
-api_key = os.environ["API_KEY"]
+api_key = os.environ["API_KEY"].strip()
 if any(ord(ch) < 32 for ch in api_key):
     print("ERROR: API Key 包含不可见控制字符，请重新输入")
     raise SystemExit(2)
@@ -294,12 +302,12 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def decode_curl_output(output):
-    marker = b"\nBT_AI_HTTP_STATUS:"
+def decode_curl_status(output):
+    marker = b"BT_AI_HTTP_STATUS:"
     if marker not in output:
-        return output, "000"
-    body, status_raw = output.rsplit(marker, 1)
-    return body, status_raw.strip().decode("ascii", "replace")
+        return "000"
+    status_raw = output.rsplit(marker, 1)[1]
+    return status_raw.strip().decode("ascii", "replace")
 
 
 def curl_config_escape(value):
@@ -312,6 +320,8 @@ def load_payload_with_curl():
         return None
 
     url = base_url + "/models"
+    response_fd, response_path = tempfile.mkstemp(prefix="bt-ai-models-response-")
+    os.close(response_fd)
     command = [
         curl,
         "--disable",
@@ -321,10 +331,16 @@ def load_payload_with_curl():
         "10",
         "--max-time",
         "20",
+        "--retry",
+        "2",
+        "--retry-delay",
+        "1",
         "--config",
         "-",
+        "--output",
+        response_path,
         "--write-out",
-        "\nBT_AI_HTTP_STATUS:%{http_code}",
+        "BT_AI_HTTP_STATUS:%{http_code}",
         url,
     ]
     request_config = (
@@ -332,14 +348,25 @@ def load_payload_with_curl():
         + 'header = "Accept: application/json"\n'
     ).encode("utf-8")
 
-    result = subprocess.run(
-        command,
-        input=request_config,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    body, status = decode_curl_output(result.stdout)
+    try:
+        result = subprocess.run(
+            command,
+            input=request_config,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        with open(response_path, "rb") as response_file:
+            body = response_file.read()
+    except OSError as exc:
+        raise CurlTransportError("curl 请求执行失败: {}".format(exc))
+    finally:
+        try:
+            os.unlink(response_path)
+        except OSError:
+            pass
+
+    status = decode_curl_status(result.stdout)
 
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", "replace").strip()
@@ -484,6 +511,11 @@ prompt_if_empty() {
   local secret="${4:-0}"
   local value="${!var_name:-}"
 
+  if [[ "$secret" -eq 1 ]]; then
+    value="$(trim_surrounding_whitespace "$value")"
+    printf -v "$var_name" '%s' "$value"
+  fi
+
   if [[ -n "$value" ]]; then
     return
   fi
@@ -507,6 +539,10 @@ prompt_if_empty() {
     else
       printf '%s\n> ' "$prompt_text" >&2
       IFS= read -r value
+    fi
+
+    if [[ "$secret" -eq 1 ]]; then
+      value="$(trim_surrounding_whitespace "$value")"
     fi
 
     if [[ -z "$value" && -n "$default_value" ]]; then
@@ -853,7 +889,9 @@ config["api_key"] = api_key
 config["models"] = models
 
 embedding["embedding_base_url"] = effective_embedding_base_url
-if (not embedding_api_key) or has_control_chars(embedding_api_key):
+if has_control_chars(embedding_api_key):
+    raise SystemExit("embedding_api_key contains invisible control characters; please re-enter it")
+if not embedding_api_key:
     embedding_api_key = api_key
 embedding["embedding_api_key"] = embedding_api_key
 embedding["embedding_model_name"] = embedding_model or "text-embedding-3-small"
