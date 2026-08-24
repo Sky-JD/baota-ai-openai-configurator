@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 SUPPORTED_DISTROS="CentOS/RHEL/AlmaLinux/Rocky Linux/Ubuntu/Debian"
 
 PANEL_PATH="${BT_PANEL:-/www/server/panel}"
@@ -126,24 +126,29 @@ mask_secret() {
 }
 
 find_python3() {
+  local candidate=""
+  local candidates=()
+
   if command -v python3 >/dev/null 2>&1; then
-    command -v python3
-    return
+    candidates+=("$(command -v python3)")
   fi
-  if [[ -x "$PANEL_PATH/pyenv/bin/python3" ]]; then
-    printf '%s\n' "$PANEL_PATH/pyenv/bin/python3"
-    return
-  fi
-  if [[ -x "$PANEL_PATH/pyenv/bin/python" ]]; then
-    "$PANEL_PATH/pyenv/bin/python" - <<'PY' >/dev/null 2>&1 && {
+  candidates+=(
+    "$PANEL_PATH/pyenv/bin/python3"
+    "$PANEL_PATH/pyenv/bin/python"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    [[ -x "$candidate" ]] || continue
+    "$candidate" - <<'PY' >/dev/null 2>&1 && {
 import sys
-raise SystemExit(0 if sys.version_info[0] == 3 else 1)
+raise SystemExit(0 if sys.version_info >= (3, 5) else 1)
 PY
-      printf '%s\n' "$PANEL_PATH/pyenv/bin/python"
+      printf '%s\n' "$candidate"
       return
     }
-  fi
-  die "未找到 Python 3。请先安装 python3，或确认宝塔面板 pyenv 存在。"
+  done
+
+  die "未找到 Python 3.5 或更高版本。请先安装 python3，或确认宝塔面板 pyenv 存在。"
 }
 
 normalize_base_url() {
@@ -173,6 +178,49 @@ normalize_base_url() {
   printf '%s\n' "$url"
 }
 
+validate_base_url() {
+  local py="$1"
+  local url="$2"
+  local label="$3"
+  local err=""
+
+  if ! err="$(VALIDATE_URL="$url" VALIDATE_LABEL="$label" "$py" - <<'PY'
+import os
+from urllib.parse import urlsplit
+
+label = os.environ["VALIDATE_LABEL"]
+value = os.environ["VALIDATE_URL"].strip()
+
+if not value:
+    print("{} 不能为空".format(label))
+    raise SystemExit(1)
+
+if any(ord(ch) < 32 for ch in value):
+    print("{} 包含不可见控制字符，请重新输入".format(label))
+    raise SystemExit(1)
+
+if any(ch.isspace() for ch in value):
+    print("{} 不能包含空格或换行: {!r}".format(label, value))
+    raise SystemExit(1)
+
+parsed = urlsplit(value)
+if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    print("{} 必须是完整的 http(s) URL，例如 https://api.example.com/v1；当前值: {}".format(label, value))
+    raise SystemExit(1)
+
+if parsed.username is not None or parsed.password is not None:
+    print("{} 不能在 URL 中包含用户名或密码".format(label))
+    raise SystemExit(1)
+
+if parsed.query or parsed.fragment:
+    print("{} 不能包含查询参数或片段: {}".format(label, value))
+    raise SystemExit(1)
+PY
+)"; then
+    die "$err"
+  fi
+}
+
 auto_select_models() {
   local py="$1"
   [[ -z "$MODELS" ]] || return 0
@@ -185,6 +233,8 @@ auto_select_models() {
   if BASE_URL="$BASE_URL" API_KEY="$API_KEY" "$py" - <<'PY' >"$tmp" 2>&1; then
 import json
 import os
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -224,6 +274,9 @@ def parse_error_body(raw):
 
 base_url = os.environ["BASE_URL"].rstrip("/")
 api_key = os.environ["API_KEY"]
+if any(ord(ch) < 32 for ch in api_key):
+    print("ERROR: API Key 包含不可见控制字符，请重新输入")
+    raise SystemExit(2)
 request = urllib.request.Request(
     base_url + "/models",
     headers={
@@ -232,10 +285,103 @@ request = urllib.request.Request(
     },
 )
 
-try:
-    with urllib.request.urlopen(request, timeout=20) as response:
+class CurlTransportError(Exception):
+    pass
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def decode_curl_output(output):
+    marker = b"\nBT_AI_HTTP_STATUS:"
+    if marker not in output:
+        return output, "000"
+    body, status_raw = output.rsplit(marker, 1)
+    return body, status_raw.strip().decode("ascii", "replace")
+
+
+def curl_config_escape(value):
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def load_payload_with_curl():
+    curl = shutil.which("curl")
+    if not curl:
+        return None
+
+    url = base_url + "/models"
+    command = [
+        curl,
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "20",
+        "--config",
+        "-",
+        "--write-out",
+        "\nBT_AI_HTTP_STATUS:%{http_code}",
+        url,
+    ]
+    request_config = (
+        'header = "Authorization: Bearer {}"\n'.format(curl_config_escape(api_key))
+        + 'header = "Accept: application/json"\n'
+    ).encode("utf-8")
+
+    result = subprocess.run(
+        command,
+        input=request_config,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    body, status = decode_curl_output(result.stdout)
+
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise CurlTransportError("curl 请求失败" + (": " + detail[:500] if detail else ""))
+
+    if not status.isdigit() or not 200 <= int(status) < 300:
+        detail = parse_error_body(body)
+        message = "HTTP " + status
+        if detail:
+            message += ": " + detail
+        raise RuntimeError(message)
+
+    return json.loads(body.decode("utf-8"))
+
+def load_payload_with_urllib():
+    opener = urllib.request.build_opener(NoRedirectHandler())
+    with opener.open(request, timeout=20) as response:
         raw = response.read()
-        payload = json.loads(raw.decode("utf-8"))
+    return json.loads(raw.decode("utf-8"))
+
+
+def load_payload():
+    curl_error = ""
+    try:
+        curl_payload = load_payload_with_curl()
+        if curl_payload is not None:
+            return curl_payload
+    except CurlTransportError as exc:
+        curl_error = str(exc)
+
+    try:
+        return load_payload_with_urllib()
+    except urllib.error.HTTPError:
+        raise
+    except urllib.error.URLError as exc:
+        if curl_error:
+            reason = str(getattr(exc, "reason", exc))
+            raise RuntimeError("{}；Python 回退也失败: {}".format(curl_error, reason))
+        raise
+
+try:
+    payload = load_payload()
 except urllib.error.HTTPError as e:
     detail = parse_error_body(e.read())
     msg = "HTTP {}".format(e.code)
@@ -244,7 +390,11 @@ except urllib.error.HTTPError as e:
     print("ERROR: " + msg)
     raise SystemExit(2)
 except urllib.error.URLError as e:
-    print("ERROR: 网络连接失败: " + str(getattr(e, "reason", e)))
+    reason = str(getattr(e, "reason", e))
+    if "unknown url type: https" in reason.lower():
+        print("ERROR: 当前 Python 不支持 HTTPS，且系统未找到 curl；请安装 curl 后重试")
+    else:
+        print("ERROR: 网络连接失败: " + reason)
     raise SystemExit(2)
 except json.JSONDecodeError:
     print("ERROR: /models 响应不是有效 JSON")
@@ -566,6 +716,7 @@ import re
 import shutil
 import sys
 import time
+from urllib.parse import urlsplit
 
 path = os.environ["CONFIG_PATH"]
 panel_path = os.environ["PANEL_PATH"].rstrip("/")
@@ -579,6 +730,26 @@ dry_run = os.environ.get("DRY_RUN") == "1"
 
 def has_control_chars(value):
     return any(ord(ch) < 32 for ch in value)
+
+def validate_http_url(name, value):
+    value = value.strip()
+    if not value:
+        raise SystemExit("missing {}".format(name))
+    if has_control_chars(value):
+        raise SystemExit("{} contains invisible control characters; please re-enter it".format(name))
+    if any(ch.isspace() for ch in value):
+        raise SystemExit("{} contains whitespace; please re-enter it".format(name))
+
+    parsed = urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise SystemExit(
+            "{} must be a full http(s) URL such as https://api.example.com/v1; got: {}".format(name, value)
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise SystemExit("{} must not contain username or password in the URL".format(name))
+    if parsed.query or parsed.fragment:
+        raise SystemExit("{} must not contain query string or fragment; got: {}".format(name, value))
+    return value
 
 def yaml_scalar(value):
     return json.dumps(value, ensure_ascii=False)
@@ -646,10 +817,16 @@ if not base_url:
     raise SystemExit("missing base_url")
 if not api_key:
     raise SystemExit("missing api_key")
+base_url = validate_http_url("base_url", base_url)
 if has_control_chars(api_key):
     raise SystemExit("api_key contains invisible control characters; please re-enter it")
 if "bt.cn" in base_url:
     raise SystemExit("base_url contains bt.cn; this script is for custom APIs")
+
+effective_embedding_base_url = validate_http_url(
+    "embedding_base_url",
+    embedding_base_url or base_url,
+)
 
 models = [item.strip() for item in models_raw.split(",") if item.strip()]
 if not models:
@@ -675,7 +852,7 @@ config["api_base_url"] = base_url
 config["api_key"] = api_key
 config["models"] = models
 
-embedding["embedding_base_url"] = embedding_base_url or base_url
+embedding["embedding_base_url"] = effective_embedding_base_url
 if (not embedding_api_key) or has_control_chars(embedding_api_key):
     embedding_api_key = api_key
 embedding["embedding_api_key"] = embedding_api_key
@@ -783,11 +960,13 @@ EOF
 
   prompt_if_empty BASE_URL "请输入 API Base URL，例如 https://api.example.com/v1"
   BASE_URL="$(normalize_base_url "$BASE_URL")"
+  validate_base_url "$py" "$BASE_URL" "API Base URL"
   log "规范化后的 API Base URL: $BASE_URL"
   prompt_if_empty API_KEY "请输入 API Key" "" 1
   auto_select_models "$py"
   prompt_if_empty EMBEDDING_BASE_URL "请输入 Embedding Base URL，留空则使用 API Base URL" "$BASE_URL"
   EMBEDDING_BASE_URL="$(normalize_base_url "$EMBEDDING_BASE_URL")"
+  validate_base_url "$py" "$EMBEDDING_BASE_URL" "Embedding Base URL"
   log "规范化后的 Embedding Base URL: $EMBEDDING_BASE_URL"
   prompt_if_empty EMBEDDING_API_KEY "请输入 Embedding API Key，留空则使用 API Key" "$API_KEY" 1
   prompt_if_empty EMBEDDING_MODEL "请输入 Embedding 模型名" "text-embedding-3-small"

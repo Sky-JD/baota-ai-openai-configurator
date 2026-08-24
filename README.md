@@ -143,6 +143,11 @@ bash configure_bt_ai_openai_api.sh \
 
 自动获取模型列表。
 
+模型列表请求会优先使用系统 `curl`，避免宝塔或系统 Python 缺少 HTTPS/SSL
+支持时出现 `unknown url type: https`。如果 `curl` 不存在或发生传输层/兼容性
+错误，脚本会回退到 Python `urllib`。为避免 API Key 被转发到其他地址，两种
+请求方式都不会自动跟随重定向，也不会在代理失败后静默改为直连。
+
 在交互模式下，多个模型会让你选择；在 `--yes` 模式下会默认选择第一个模型。如果自动获取失败，脚本会解析 OpenAI/New API 风格错误，例如：
 
 ```json
@@ -305,6 +310,7 @@ bt restart
 - API 提供商不支持 `/v1/models`
 - 当前 Key 没有模型列表权限
 - Base URL 填错
+- 系统没有安装 `curl`，且当前 Python 不支持 HTTPS
 
 可以手动传入模型：
 
